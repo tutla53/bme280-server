@@ -1,25 +1,34 @@
 #![no_std]
 #![no_main]
 
+mod gpio_list;
+
 use {
+    crate::gpio_list::{
+        Irqs,
+        AssignedResources,
+        DisplayResources,
+        BmeResources,
+    },
     cyw43::JoinOptions,
     cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER},
     embassy_executor::Spawner,
     embassy_time::{Duration, Timer},
+    embassy_sync::{
+        mutex::Mutex,
+        blocking_mutex::raw::CriticalSectionRawMutex,
+    },
     embassy_net::{
         tcp::TcpSocket,
         Config,
         DhcpConfig, 
         StackResources,
+        Ipv4Address,
     },
     embassy_rp::{
-        bind_interrupts,
-        pio::InterruptHandler as PioInterruptHandler,
-        usb::InterruptHandler as UsbInterruptHandler,
-        i2c::InterruptHandler as I2cInterruptHandler,     
         clocks::RoscRng,
         gpio::{Level, Output},
-        peripherals::{DMA_CH0, PIO0, USB, I2C0, I2C1},
+        peripherals::{DMA_CH0, PIO0, USB},
         pio::Pio,
         usb::Driver,
         i2c::{I2c, Config as I2cConfig},
@@ -42,12 +51,63 @@ use {
     {defmt_rtt as _, panic_probe as _},
 };
 
-bind_interrupts!(pub struct Irqs {
-    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    USBCTRL_IRQ => UsbInterruptHandler<USB>;
-    I2C0_IRQ => I2cInterruptHandler<I2C0>;
-    I2C1_IRQ => I2cInterruptHandler<I2C1>;
-});
+#[derive(Clone, Copy)]
+struct BmeData {
+    temperature: f32,
+    humidity: f32,
+    pressure:f32,
+}
+
+struct BmeState {
+    state : Mutex<CriticalSectionRawMutex, BmeData>,
+}
+
+impl BmeState {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(BmeData{temperature: 0.0, humidity: 0.0, pressure: 0.0}),
+        }
+    }
+
+    async fn get_data(&self) -> BmeData {
+        return *self.state.lock().await;
+    }
+
+    async fn set_data(&self, temperature:f32, humidity:f32, pressure:f32) {
+        let new_state = BmeData {
+            temperature: temperature, 
+            humidity:humidity, 
+            pressure:pressure
+        };
+        let mut current_state = self.state.lock().await;
+        *current_state = new_state;
+    }
+
+}
+
+struct PicoAddress {
+    ip: Mutex<CriticalSectionRawMutex, Ipv4Address>,
+}
+
+impl PicoAddress {
+    const fn new() -> Self {
+        Self {
+            ip: Mutex::new(Ipv4Address::new(0, 0, 0, 0)),
+        }
+    }
+
+    async fn get_ip(&self) -> Ipv4Address {
+        return *self.ip.lock().await;
+    }
+
+    async fn set_ip(&self, new_ip: Ipv4Address) {
+        let mut current_ip = self.ip.lock().await;
+        *current_ip = new_ip;
+    }
+}
+
+static BME: BmeState = BmeState::new();
+static IP_ADDRESS: PicoAddress = PicoAddress::new();
 
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
@@ -114,17 +174,11 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
-    let usb_driver = Driver::new(p.USB, Irqs);
-    let mut led_toggle_status = true;
-    spawner.must_spawn(usb_logger_task(usb_driver));
+#[embassy_executor::task]
+async fn display_task(p: DisplayResources) {
+    let i2c = I2c::new_async(p.I2C_CH, p.SCL_PIN, p.SDA_PIN, Irqs, I2cConfig::default());
 
-    let i2c0 = I2c::new_async(p.I2C0, p.PIN_13, p.PIN_12, Irqs, I2cConfig::default());
-    let i2c1 = I2c::new_async(p.I2C1, p.PIN_27, p.PIN_26, Irqs, I2cConfig::default());
-
-    let interface = I2CDisplayInterface::new(i2c1);
+    let interface = I2CDisplayInterface::new(i2c);
     let mut display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
     
     loop {
@@ -144,8 +198,38 @@ async fn main(spawner: Spawner) {
     display.set_position(2, 0).await.unwrap();
     let _ = display.write_str("Air Monitor").await;
 
+    loop {
+        let data = BME.get_data().await;
+        let ip = IP_ADDRESS.get_ip().await;
+
+        let mut ip_str = String::<32>::new();
+        let mut temp_str = String::<32>::new();
+        let mut humidity_str = String::<32>::new();
+        let mut pressure_str = String::<32>::new();
+        
+        write!(&mut ip_str, "{}.{}.{}.{}", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
+        write!(&mut temp_str, "Temp: {:.2} C", data.temperature).unwrap();
+        write!(&mut humidity_str, "Humidity: {:.1}%", data.humidity).unwrap();
+        write!(&mut pressure_str, "P: {:.1} hPa", data.pressure).unwrap();
+
+        display.set_position(0, 2).await.unwrap();
+        let _ = display.write_str(&ip_str).await;
+        display.set_position(0, 4).await.unwrap();
+        let _ = display.write_str(&temp_str).await;
+        display.set_position(0, 5).await.unwrap();
+        let _ = display.write_str(&humidity_str).await;
+        display.set_position(0, 6).await.unwrap();
+        let _ = display.write_str(&pressure_str).await;
+        Timer::after(Duration::from_secs(1)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn bme_task(p: BmeResources) {
+    let i2c = I2c::new_async(p.I2C_CH, p.SCL_PIN, p.SDA_PIN, Irqs, I2cConfig::default());
+
     let mut delay = embassy_time::Delay;
-    let mut bme280 = BME280::new_primary(i2c0);
+    let mut bme280 = BME280::new_primary(i2c);
 
     loop {
         match bme280.init(&mut delay) {
@@ -159,6 +243,30 @@ async fn main(spawner: Spawner) {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
+
+    loop {
+        match bme280.measure(&mut delay) {
+            Ok(data) => {
+                BME.set_data(data.temperature, data.humidity, data.pressure/100.0).await;
+            },
+            Err(_) => {
+                BME.set_data(0.0, 0.0, 0.0).await;
+            }
+        }
+        Timer::after(Duration::from_secs(1)).await;
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+    let mut led_toggle_status = true;
+    let usb_driver = Driver::new(p.USB, Irqs);
+    spawner.must_spawn(usb_logger_task(usb_driver));
+
+    let ph = split_resources!(p);
+    spawner.must_spawn(display_task(ph.display_resources));
+    spawner.must_spawn(bme_task(ph.bme_resources));
 
     log::info!("Preparing the Server!");
 
@@ -236,6 +344,7 @@ async fn main(spawner: Spawner) {
     match stack.config_v4(){
         Some(value) => {
             log::info!("Server Address: {:?}", value.address.address());
+            IP_ADDRESS.set_ip(value.address.address()).await;
             Timer::after_millis(100).await;
         },
         None => log::warn!("Unable to Get the Adrress")
@@ -280,20 +389,12 @@ async fn main(spawner: Spawner) {
                     let mut temp_str = String::<32>::new();
                     let mut humidity_str = String::<32>::new();
                     let mut pressure_str = String::<32>::new();
-
-                    match bme280.measure(&mut delay) {
-                        Ok(data) => {
-                            write!(&mut temp_str, "{:.2}", data.temperature).unwrap();
-                            write!(&mut humidity_str, "{:.2}", data.humidity).unwrap();
-                            write!(&mut pressure_str, "{:.2}", data.pressure/100.0).unwrap();
-                        },
-                        Err(e) => {
-                            write!(&mut temp_str, "{:?}", e).unwrap();
-                            write!(&mut humidity_str, "{:?}", e).unwrap();
-                            write!(&mut pressure_str, "{:?}", e).unwrap();
-                        }
-                    }
-
+                    
+                    let data = BME.get_data().await;
+                    write!(&mut temp_str, "{:.2}", data.temperature).unwrap();
+                    write!(&mut humidity_str, "{:.2}", data.humidity).unwrap();
+                    write!(&mut pressure_str, "{:.2}", data.pressure).unwrap();
+                    
                     // Process SSI template
                     processed_html = process_ssi(processed_html.as_str(), SSI_TEMP_TAG, temp_str.as_str());
                     processed_html = process_ssi(processed_html.as_str(), SSI_HUMID_TAG, humidity_str.as_str());

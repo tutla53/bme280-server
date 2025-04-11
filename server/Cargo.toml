@@ -51,6 +51,7 @@ pio = "0.2.1"
 rand = { version = "0.8.5", default-features = false }
 embedded-sdmmc = "0.7.0"
 bme280 = "0.5.1"
+ssd1306 = { version = "0.10.0", features = ["graphics", "async"] }
 
 [profile.release]
 debug = 2

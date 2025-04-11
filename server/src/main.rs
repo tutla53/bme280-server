@@ -4,7 +4,6 @@
 use {
     cyw43::JoinOptions,
     cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER},
-    
     embassy_executor::Spawner,
     embassy_time::{Duration, Timer},
     embassy_net::{
@@ -20,22 +19,35 @@ use {
         i2c::InterruptHandler as I2cInterruptHandler,     
         clocks::RoscRng,
         gpio::{Level, Output},
-        peripherals::{DMA_CH0, PIO0, USB, I2C0},
+        peripherals::{DMA_CH0, PIO0, USB, I2C0, I2C1},
         pio::Pio,
         usb::Driver,
         i2c::{I2c, Config as I2cConfig},
     },
-
-    embedded_io_async::Write,
+    embedded_io_async::Write as EmbeddedWriter,
     core::str::{from_utf8, FromStr},
     rand::RngCore,
     static_cell::StaticCell,
     defmt::{unwrap, info},
     heapless::String,
-    core::fmt::Write as CoreWrite,
+    core::fmt::Write,
     bme280::i2c::BME280,
+    ssd1306::{
+        I2CDisplayInterface,
+        Ssd1306Async,
+        prelude::DisplayRotation,
+        size::DisplaySize128x64,
+        mode::DisplayConfigAsync,
+    },
     {defmt_rtt as _, panic_probe as _},
 };
+
+bind_interrupts!(pub struct Irqs {
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
+    I2C0_IRQ => I2cInterruptHandler<I2C0>;
+    I2C1_IRQ => I2cInterruptHandler<I2C1>;
+});
 
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
@@ -65,13 +77,6 @@ const CYW43_JOIN_ERROR: [&str; 16] = [
     "Scan aborted due to CCX fast roam",
     "Abort channel select"
 ];
-
-bind_interrupts!(pub struct Irqs {
-    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    USBCTRL_IRQ => UsbInterruptHandler<USB>;
-    I2C0_IRQ => I2cInterruptHandler<I2C0>;
-
-});
 
 fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> String<BUFF_SIZE>{
     let mut processed_html = String::<BUFF_SIZE>::new();
@@ -113,12 +118,35 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let usb_driver = Driver::new(p.USB, Irqs);
-    let i2c0 = I2c::new_async(p.I2C0, p.PIN_1, p.PIN_0, Irqs, I2cConfig::default());
     let mut led_toggle_status = true;
+    spawner.must_spawn(usb_logger_task(usb_driver));
+
+    let i2c0 = I2c::new_async(p.I2C0, p.PIN_13, p.PIN_12, Irqs, I2cConfig::default());
+    let i2c1 = I2c::new_async(p.I2C1, p.PIN_27, p.PIN_26, Irqs, I2cConfig::default());
+
+    let interface = I2CDisplayInterface::new(i2c1);
+    let mut display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
+    
+    loop {
+        match display.init().await{
+            Ok(()) => {
+                log::warn!("Display has been Initialized");
+                break;
+            }
+            Err(e) => {
+                log::warn!("Write Error: {:?}", e);
+            }
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    display.clear().await.unwrap();
+    display.set_position(2, 0).await.unwrap();
+    let _ = display.write_str("Air Monitor").await;
 
     let mut delay = embassy_time::Delay;
     let mut bme280 = BME280::new_primary(i2c0);
-    
+
     loop {
         match bme280.init(&mut delay) {
             Ok(()) => {
@@ -131,8 +159,6 @@ async fn main(spawner: Spawner) {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-
-    unwrap!(spawner.spawn(usb_logger_task(usb_driver)));
 
     log::info!("Preparing the Server!");
 

@@ -48,7 +48,13 @@ struct BmeState {
 impl BmeState {
     const fn new() -> Self {
         Self {
-            state: Mutex::new(BmeData{temperature: 0.0, humidity: 0.0, pressure: 0.0}),
+            state: Mutex::new(
+                BmeData{
+                    temperature: 0.0, 
+                    humidity: 0.0, 
+                    pressure: 0.0
+                }
+            ),
         }
     }
 
@@ -151,9 +157,22 @@ async fn bme_task(p: BmeResources) {
             },
             Err(_) => {
                 BME.set_data(0.0, 0.0, 0.0).await;
+
+                loop {
+                    match bme280.init(&mut delay) {
+                        Ok(()) => {
+                            log::info!("BME280 initialized"); 
+                            break; 
+                        },
+                        Err(e) => {
+                            log::info!("{:?}", e);
+                        }
+                    }
+                    Timer::after(Duration::from_millis(500)).await;
+                }
             }
         }
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 

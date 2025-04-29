@@ -13,7 +13,7 @@ use {
     cyw43::JoinOptions,
     cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER},
     embassy_executor::Spawner,
-    embassy_time::{Duration, Timer},
+    embassy_time::{Duration, Timer, with_timeout},
     embassy_sync::{
         mutex::Mutex,
         blocking_mutex::raw::CriticalSectionRawMutex,
@@ -208,18 +208,149 @@ async fn display_task(p: DisplayResources) {
         let mut pressure_str = String::<32>::new();
         
         write!(&mut ip_str, "{}.{}.{}.{}", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
-        write!(&mut temp_str, "Temp: {:.2} C", data.temperature).unwrap();
-        write!(&mut humidity_str, "Humidity: {:.1}%", data.humidity).unwrap();
-        write!(&mut pressure_str, "P: {:.1} hPa", data.pressure).unwrap();
+        write!(&mut temp_str,     "Temp: {:.2} C", data.temperature).unwrap();
+        write!(&mut humidity_str, "RH  : {:.2} %", data.humidity).unwrap();
+        write!(&mut pressure_str, "P   : {:.3} atm", data.pressure).unwrap();
 
-        display.set_position(0, 2).await.unwrap();
-        let _ = display.write_str(&ip_str).await;
-        display.set_position(0, 4).await.unwrap();
-        let _ = display.write_str(&temp_str).await;
-        display.set_position(0, 5).await.unwrap();
-        let _ = display.write_str(&humidity_str).await;
-        display.set_position(0, 6).await.unwrap();
-        let _ = display.write_str(&pressure_str).await;
+        display.set_position(2, 0).await.unwrap();
+        let _ = display.write_str("Air Monitor").await;
+        
+        if let Err(e) = display.set_position(0, 2).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
+        if let Err(e) = display.write_str(&ip_str).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
+        if let Err(e) = display.set_position(0, 4).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
+        if let Err(e) = display.write_str(&temp_str).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+        
+        if let Err(e) = display.set_position(0, 5).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
+        if let Err(e) = display.write_str(&humidity_str).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
+        if let Err(e) = display.set_position(0, 6).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
+        if let Err(e) = display.write_str(&pressure_str).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+
         Timer::after(Duration::from_secs(1)).await;
     }
 }
@@ -247,13 +378,25 @@ async fn bme_task(p: BmeResources) {
     loop {
         match bme280.measure(&mut delay) {
             Ok(data) => {
-                BME.set_data(data.temperature, data.humidity, data.pressure/100.0).await;
+                BME.set_data(data.temperature, data.humidity, (data.pressure*0.9869233)/100_000.0).await;
             },
             Err(_) => {
                 BME.set_data(0.0, 0.0, 0.0).await;
+                loop {
+                    match bme280.init(&mut delay) {
+                        Ok(()) => {
+                            log::info!("BME280 initialized"); 
+                            break; 
+                        },
+                        Err(e) => {
+                            log::info!("{:?}", e);
+                        }
+                    }
+                    Timer::after(Duration::from_millis(500)).await;
+                }
             }
         }
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
@@ -359,15 +502,34 @@ async fn main(spawner: Spawner) {
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(10)));
 
-        if let Err(e) = socket.accept(TCP_PORT).await {
-            log::warn!("Accept Error: {:?}", e);
-            continue;
+        log::info!("Listening on TCP: {} ...", TCP_PORT);
+        let socket_timeout = 10;
+        match with_timeout(Duration::from_secs(socket_timeout), socket.accept(TCP_PORT)).await {
+            Ok(value) => {
+                match value {
+                    Ok(()) => {
+                        socket.set_timeout(Some(Duration::from_secs(socket_timeout+5)));
+                    },
+                    Err(e) => {
+                        log::warn!("Accept Error: {:?}", e);
+                        control.gpio_set(0, led_toggle_status).await;
+                        led_toggle_status  = !led_toggle_status;
+                        continue;
+                    }
+                }
+            },
+            Err(_) => {
+                log::warn!("No Connection after {}s", socket_timeout);
+                control.gpio_set(0, led_toggle_status).await;
+                led_toggle_status  = !led_toggle_status;
+                continue;
+            }
         }
 
         log::info!("Received Connection from {:?}", socket.remote_endpoint());
-        
+        control.gpio_set(0, true).await;
+
         // Currently only accept 1 connection at a time
         loop {
             match socket.read(&mut buf).await {
@@ -393,7 +555,7 @@ async fn main(spawner: Spawner) {
                     let data = BME.get_data().await;
                     write!(&mut temp_str, "{:.2}", data.temperature).unwrap();
                     write!(&mut humidity_str, "{:.2}", data.humidity).unwrap();
-                    write!(&mut pressure_str, "{:.2}", data.pressure).unwrap();
+                    write!(&mut pressure_str, "{:.3}", data.pressure).unwrap();
                     
                     // Process SSI template
                     processed_html = process_ssi(processed_html.as_str(), SSI_TEMP_TAG, temp_str.as_str());

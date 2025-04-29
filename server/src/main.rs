@@ -110,7 +110,7 @@ async fn display_task(p: DisplayResources) {
         write!(&mut ip_str, "No WIFI").unwrap();
         write!(&mut temp_str, "Temp: {:.2} C", data.temperature).unwrap();
         write!(&mut humidity_str, "Humidity: {:.1}%", data.humidity).unwrap();
-        write!(&mut pressure_str, "P: {:.1} hPa", data.pressure).unwrap();
+        write!(&mut pressure_str, "P: {:.3} atm", data.pressure).unwrap();
 
         display.set_position(0, 2).await.unwrap();
         let _ = display.write_str(&ip_str).await;
@@ -147,7 +147,7 @@ async fn bme_task(p: BmeResources) {
     loop {
         match bme280.measure(&mut delay) {
             Ok(data) => {
-                BME.set_data(data.temperature, data.humidity, data.pressure/100.0).await;
+                BME.set_data(data.temperature, data.humidity, (data.pressure*0.9869233)/100000.0).await;
             },
             Err(_) => {
                 BME.set_data(0.0, 0.0, 0.0).await;

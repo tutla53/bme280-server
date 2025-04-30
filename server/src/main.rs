@@ -34,7 +34,6 @@ use {
     {defmt_rtt as _, panic_probe as _},
 };
 
-#[derive(Clone, Copy)]
 struct TimeFormat {
     days: u64,
     hours: u64,
@@ -61,7 +60,6 @@ impl TimeFormat {
     }
 }
 
-// #[derive(Clone, Copy)]
 struct MessageFormat {
     message: String<32>,
     row: u8,
@@ -93,6 +91,20 @@ impl DisplayMessage {
 
 static DISPLAY: DisplayMessage = DisplayMessage::new();
 
+async fn set_title() {
+    let mut title = String::<32>::new();
+    let mut second = String::<32>::new();
+    let mut third = String::<32>::new();
+
+    write!(&mut title,  "  Air Monitor   ").unwrap();
+    write!(&mut second, "                ").unwrap();
+    write!(&mut third,  "                ").unwrap();
+
+    DISPLAY.set_data(title, 0, 0).await;
+    DISPLAY.set_data(second, 1, 0).await;
+    DISPLAY.set_data(third, 2, 0).await;
+}
+
 #[embassy_executor::task]
 async fn usb_logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
@@ -119,8 +131,7 @@ async fn display_task(p: DisplayResources) {
     }
 
     display.clear().await.unwrap();
-    display.set_position(2, 0).await.unwrap();
-    let _ = display.write_str("Air Monitor").await;
+    set_title().await;
 
     loop {
         let data = DISPLAY.state.receive().await;
@@ -128,22 +139,11 @@ async fn display_task(p: DisplayResources) {
         if let Err(e) = display.set_position(data.col, data.row).await {
             log::info!("{:?}", e);
             loop {
-                match display.init().await{
+                match display.init().await {
                     Ok(()) => {
                         log::warn!("Display has been Initialized");
                         display.clear().await.unwrap();
-
-                        let mut title = String::<32>::new();
-                        let mut second = String::<32>::new();
-                        let mut third = String::<32>::new();
-        
-                        write!(&mut title,  "  Air Monitor   ").unwrap();
-                        write!(&mut second, "                ").unwrap();
-                        write!(&mut third,  "                ").unwrap();
-        
-                        DISPLAY.set_data(title, 0, 0).await;
-                        DISPLAY.set_data(second, 1, 0).await;
-                        DISPLAY.set_data(third, 2, 0).await;
+                        set_title().await;
                         break;
                     }
                     Err(e) => {
@@ -157,12 +157,11 @@ async fn display_task(p: DisplayResources) {
         if let Err(e) = display.write_str(&data.message).await {
             log::info!("{:?}", e);
             loop {
-                match display.init().await{
+                match display.init().await {
                     Ok(()) => {
                         log::warn!("Display has been Initialized");
                         display.clear().await.unwrap();
-                        display.set_position(2, 0).await.unwrap();
-                        let _ = display.write_str("Air Monitor").await;
+                        set_title().await;
                         break;
                     }
                     Err(e) => {

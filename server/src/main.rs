@@ -35,35 +35,6 @@ use {
 };
 
 #[derive(Clone, Copy)]
-struct BmeData {
-    temperature: f32,
-    humidity: f32,
-    pressure:f32,
-}
-
-struct BmeState {
-    state : Channel<CriticalSectionRawMutex, BmeData, 100>,
-}
-
-impl BmeState {
-    const fn new() -> Self {
-        Self {
-            state: Channel::new(),
-        }
-    }
-
-    async fn set_data(&self, temperature:f32, humidity:f32, pressure:f32) {
-        let new_state = BmeData {
-            temperature: temperature, 
-            humidity:humidity, 
-            pressure:pressure
-        };
-
-        let _ = self.state.try_send(new_state);
-    }
-}
-
-#[derive(Clone, Copy)]
 struct TimeFormat {
     days: u64,
     hours: u64,
@@ -71,18 +42,8 @@ struct TimeFormat {
     seconds: u64,
 }
 
-struct UpTime {
-    state : Channel<CriticalSectionRawMutex, TimeFormat, 100>,
-}
-
-impl UpTime {
-    const fn new() -> Self {
-        Self {
-            state: Channel::new(),
-        }
-    }
-
-    async fn set_data(&self, duration: embassy_time::Duration) {
+impl TimeFormat {
+    fn get_format(duration: embassy_time::Duration) -> TimeFormat {
         let total_seconds = duration.as_secs();
         let days = total_seconds / 86400;  
         let remaining = total_seconds % 86400;
@@ -91,19 +52,46 @@ impl UpTime {
         let minutes = remaining / 60;
         let seconds = remaining % 60;
 
-        let new_state = TimeFormat {
+        return TimeFormat {
             days: days,
             hours: hours, 
             minutes: minutes, 
             seconds: seconds
         };
-
-        let _ = self.state.try_send(new_state);
     }
 }
 
-static BME: BmeState = BmeState::new();
-static UPTIME: UpTime = UpTime::new();
+// #[derive(Clone, Copy)]
+struct MessageFormat {
+    message: String<32>,
+    row: u8,
+    col: u8,
+}
+
+struct DisplayMessage {
+    state : Channel<CriticalSectionRawMutex, MessageFormat, 1024>,
+}
+
+impl DisplayMessage {
+    const fn new() -> Self {
+        Self {
+            state: Channel::new(),
+        }
+    }
+
+    async fn set_data(&self, message: String<32>, row: u8, col:u8) {
+        
+        let new_state = MessageFormat {
+            message: message,
+            row: row, 
+            col: col,
+        };
+
+        self.state.send(new_state).await;
+    }
+}
+
+static DISPLAY: DisplayMessage = DisplayMessage::new();
 
 #[embassy_executor::task]
 async fn usb_logger_task(driver: Driver<'static, USB>) {
@@ -133,35 +121,47 @@ async fn display_task(p: DisplayResources) {
     display.clear().await.unwrap();
     display.set_position(2, 0).await.unwrap();
     let _ = display.write_str("Air Monitor").await;
-    let mut tick = Ticker::every(Duration::from_millis(500));
 
     loop {
-        if let Ok(uptime) = UPTIME.state.try_receive() {  
-            let mut uptime_str = String::<32>::new();
-            write!(&mut uptime_str,   "{}d:{:02}h:{:02}m:{:02}s", uptime.days, uptime.hours, uptime.minutes, uptime.seconds).unwrap(); 
-            display.set_position(0, 4).await.unwrap();
-            let _ = display.write_str(&uptime_str).await;
-        }
+        let data = DISPLAY.state.receive().await;
 
-        if let Ok(data) = BME.state.try_receive() {
-            let mut temp_str = String::<32>::new();
-            let mut humidity_str = String::<32>::new();
-            let mut pressure_str = String::<32>::new();
-            
-            
-            write!(&mut temp_str,     "Temp:{:.2} C", data.temperature).unwrap();
-            write!(&mut humidity_str, "RH  :{:.2} %", data.humidity).unwrap();
-            write!(&mut pressure_str, "P   :{:.3} atm", data.pressure).unwrap();
-
-            display.set_position(0, 5).await.unwrap();
-            let _ = display.write_str(&temp_str).await;
-            display.set_position(0, 6).await.unwrap();
-            let _ = display.write_str(&humidity_str).await;
-            display.set_position(0, 7).await.unwrap();
-            let _ = display.write_str(&pressure_str).await;
-        }
-
-        tick.next().await;
+        if let Err(e) = display.set_position(data.col, data.row).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        display.set_position(2, 0).await.unwrap();
+                        let _ = display.write_str("Air Monitor").await;
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
+        
+        if let Err(e) = display.write_str(&data.message).await {
+            log::info!("{:?}", e);
+            loop {
+                match display.init().await{
+                    Ok(()) => {
+                        log::warn!("Display has been Initialized");
+                        display.clear().await.unwrap();
+                        display.set_position(2, 0).await.unwrap();
+                        let _ = display.write_str("Air Monitor").await;
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Write Error: {:?}", e);
+                    }
+                }
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        };
     }
 }
 
@@ -190,10 +190,32 @@ async fn bme_task(p: BmeResources) {
     loop {
         match bme280.measure(&mut delay) {
             Ok(data) => {
-                BME.set_data(data.temperature, data.humidity, (data.pressure*0.9869233)/100000.0).await;
+                let mut temp_str = String::<32>::new();
+                let mut humidity_str = String::<32>::new();
+                let mut pressure_str = String::<32>::new();
+
+                write!(&mut temp_str,     "Temp:{:.2} C", data.temperature).unwrap();
+                write!(&mut humidity_str, "RH  :{:.2} %", data.humidity).unwrap();
+                write!(&mut pressure_str, "P   :{:.3} atm", (data.pressure*0.9869233)/100000.0).unwrap();
+
+                DISPLAY.set_data(temp_str, 5, 0).await;
+                DISPLAY.set_data(humidity_str, 6, 0).await;
+                DISPLAY.set_data(pressure_str, 7, 0).await;
+
             },
             Err(_) => {
-                BME.set_data(0.0, 0.0, 0.0).await;
+                let mut temp_str = String::<32>::new();
+                let mut humidity_str = String::<32>::new();
+                let mut pressure_str = String::<32>::new();
+
+                write!(&mut temp_str,     "Temp: n/a C ").unwrap();
+                write!(&mut humidity_str, "RH  : n/a % ").unwrap();
+                write!(&mut pressure_str, "P   : n/a atm ").unwrap();
+
+                DISPLAY.set_data(temp_str, 5, 0).await;
+                DISPLAY.set_data(humidity_str, 6, 0).await;
+                DISPLAY.set_data(pressure_str, 7, 0).await;
+
 
                 loop {
                     match bme280.init(&mut delay) {
@@ -228,7 +250,11 @@ async fn main(spawner: Spawner) {
     let uptime = Instant::now();
     
     loop {
-        UPTIME.set_data(uptime.elapsed()).await;
+        let uptime_format = TimeFormat::get_format(uptime.elapsed());
+        let mut uptime_str = String::<32>::new();
+        write!(&mut uptime_str,   "{}d:{:02}h:{:02}m:{:02}s", uptime_format.days, uptime_format.hours, uptime_format.minutes, uptime_format.seconds).unwrap();
+        DISPLAY.set_data(uptime_str, 4, 0).await;
+
         tick.next().await;
     }
 }

@@ -132,8 +132,18 @@ async fn display_task(p: DisplayResources) {
                     Ok(()) => {
                         log::warn!("Display has been Initialized");
                         display.clear().await.unwrap();
-                        display.set_position(2, 0).await.unwrap();
-                        let _ = display.write_str("Air Monitor").await;
+
+                        let mut title = String::<32>::new();
+                        let mut second = String::<32>::new();
+                        let mut third = String::<32>::new();
+        
+                        write!(&mut title,  "  Air Monitor   ").unwrap();
+                        write!(&mut second, "                ").unwrap();
+                        write!(&mut third,  "                ").unwrap();
+        
+                        DISPLAY.set_data(title, 0, 0).await;
+                        DISPLAY.set_data(second, 1, 0).await;
+                        DISPLAY.set_data(third, 2, 0).await;
                         break;
                     }
                     Err(e) => {

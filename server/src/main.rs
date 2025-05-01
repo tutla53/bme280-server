@@ -29,8 +29,9 @@ use {
         Ssd1306Async,
         prelude::DisplayRotation,
         size::DisplaySize128x64,
-        mode::DisplayConfigAsync,
+        mode::{DisplayConfigAsync, TerminalModeAsync, TerminalDisplaySizeAsync},
     },
+    display_interface::AsyncWriteOnlyDataCommand,
     {defmt_rtt as _, panic_probe as _},
 };
 
@@ -91,18 +92,65 @@ impl DisplayMessage {
 
 static DISPLAY: DisplayMessage = DisplayMessage::new();
 
-async fn set_title() {
-    let mut title = String::<32>::new();
-    let mut second = String::<32>::new();
-    let mut third = String::<32>::new();
+struct OledSsd1306<DI, SIZE> {
+    display: Ssd1306Async<DI, SIZE, TerminalModeAsync>,
+    ch: &'static DisplayMessage,
+}
 
-    write!(&mut title,  "  Air Monitor   ").unwrap();
-    write!(&mut second, "                ").unwrap();
-    write!(&mut third,  "                ").unwrap();
+impl<DI, SIZE> OledSsd1306<DI, SIZE>
+where
+    DI: AsyncWriteOnlyDataCommand,
+    SIZE: TerminalDisplaySizeAsync, 
+{
+    fn new(display: Ssd1306Async<DI, SIZE, TerminalModeAsync>, ch: &'static DisplayMessage) -> Self {
+        Self {
+            display,
+            ch,
+        }
+    }
+    
+    async fn init(&mut self) {
+        loop {
+            match self.display.init().await{
+                Ok(()) => {
+                    log::warn!("Display has been Initialized");
+                    self.display.clear().await.unwrap();
+                    self.set_title().await;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("Write Error: {:?}", e);
+                }
+            }
+            Timer::after(Duration::from_millis(500)).await;
+        }   
+    }
 
-    DISPLAY.set_data(title, 0, 0).await;
-    DISPLAY.set_data(second, 1, 0).await;
-    DISPLAY.set_data(third, 2, 0).await;
+    async fn set_title(&mut self) {
+        let mut title = String::<32>::new();
+        let mut second = String::<32>::new();
+        let mut third = String::<32>::new();
+    
+        write!(&mut title,  "  Air Monitor   ").unwrap();
+        write!(&mut second, "                ").unwrap();
+        write!(&mut third,  "                ").unwrap();
+    
+        self.ch.set_data(title, 0, 0).await;
+        self.ch.set_data(second, 1, 0).await;
+        self.ch.set_data(third, 2, 0).await;
+    }
+
+    async fn write_available_message(&mut self) {
+        let data = self.ch.state.receive().await;
+        let set_pos_status = self.display.set_position(data.col, data.row).await;
+        let write_str_status = self.display.write_str(&data.message).await;
+
+        if set_pos_status.is_err() || write_str_status.is_err() {
+            log::info!("{:?}", set_pos_status);
+            log::info!("{:?}", write_str_status);
+            self.init().await;
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -115,62 +163,13 @@ async fn display_task(p: DisplayResources) {
     let i2c = I2c::new_async(p.I2C_CH, p.SCL_PIN, p.SDA_PIN, Irqs, I2cConfig::default());
 
     let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
+    let display = Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
+    let mut oled = OledSsd1306::new(display, &DISPLAY);
     
-    loop {
-        match display.init().await{
-            Ok(()) => {
-                log::warn!("Display has been Initialized");
-                break;
-            }
-            Err(e) => {
-                log::warn!("Write Error: {:?}", e);
-            }
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-
-    display.clear().await.unwrap();
-    set_title().await;
+    oled.init().await;
 
     loop {
-        let data = DISPLAY.state.receive().await;
-
-        if let Err(e) = display.set_position(data.col, data.row).await {
-            log::info!("{:?}", e);
-            loop {
-                match display.init().await {
-                    Ok(()) => {
-                        log::warn!("Display has been Initialized");
-                        display.clear().await.unwrap();
-                        set_title().await;
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("Write Error: {:?}", e);
-                    }
-                }
-                Timer::after(Duration::from_millis(500)).await;
-            }
-        };
-        
-        if let Err(e) = display.write_str(&data.message).await {
-            log::info!("{:?}", e);
-            loop {
-                match display.init().await {
-                    Ok(()) => {
-                        log::warn!("Display has been Initialized");
-                        display.clear().await.unwrap();
-                        set_title().await;
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("Write Error: {:?}", e);
-                    }
-                }
-                Timer::after(Duration::from_millis(500)).await;
-            }
-        };
+        oled.write_available_message().await;
     }
 }
 
@@ -210,7 +209,6 @@ async fn bme_task(p: BmeResources) {
                 DISPLAY.set_data(temp_str, 5, 0).await;
                 DISPLAY.set_data(humidity_str, 6, 0).await;
                 DISPLAY.set_data(pressure_str, 7, 0).await;
-
             },
             Err(_) => {
                 let mut temp_str = String::<32>::new();
@@ -224,7 +222,6 @@ async fn bme_task(p: BmeResources) {
                 DISPLAY.set_data(temp_str, 5, 0).await;
                 DISPLAY.set_data(humidity_str, 6, 0).await;
                 DISPLAY.set_data(pressure_str, 7, 0).await;
-
 
                 loop {
                     match bme280.init(&mut delay) {

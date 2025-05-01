@@ -21,6 +21,7 @@ use {
         usb::Driver,
         i2c::{I2c, Config as I2cConfig},
     },
+    embedded_hal::i2c::{I2c as EmbeddedI2c, ErrorType},
     heapless::String,
     core::fmt::Write,
     bme280::i2c::BME280,
@@ -93,8 +94,8 @@ impl DisplayMessage {
 static DISPLAY: DisplayMessage = DisplayMessage::new();
 
 struct OledSsd1306<DI, SIZE> {
-    display: Ssd1306Async<DI, SIZE, TerminalModeAsync>,
-    ch: &'static DisplayMessage,
+    oled: Ssd1306Async<DI, SIZE, TerminalModeAsync>,
+    display: &'static DisplayMessage,
 }
 
 impl<DI, SIZE> OledSsd1306<DI, SIZE>
@@ -102,19 +103,19 @@ where
     DI: AsyncWriteOnlyDataCommand,
     SIZE: TerminalDisplaySizeAsync, 
 {
-    fn new(display: Ssd1306Async<DI, SIZE, TerminalModeAsync>, ch: &'static DisplayMessage) -> Self {
+    fn new(oled: Ssd1306Async<DI, SIZE, TerminalModeAsync>, display: &'static DisplayMessage) -> Self {
         Self {
+            oled,
             display,
-            ch,
         }
     }
     
     async fn init(&mut self) {
         loop {
-            match self.display.init().await{
+            match self.oled.init().await{
                 Ok(()) => {
                     log::warn!("Display has been Initialized");
-                    self.display.clear().await.unwrap();
+                    self.oled.clear().await.unwrap();
                     self.set_title().await;
                     break;
                 }
@@ -135,20 +136,81 @@ where
         write!(&mut second, "                ").unwrap();
         write!(&mut third,  "                ").unwrap();
     
-        self.ch.set_data(title, 0, 0).await;
-        self.ch.set_data(second, 1, 0).await;
-        self.ch.set_data(third, 2, 0).await;
+        self.display.set_data(title, 0, 0).await;
+        self.display.set_data(second, 1, 0).await;
+        self.display.set_data(third, 2, 0).await;
     }
 
     async fn write_available_message(&mut self) {
-        let data = self.ch.state.receive().await;
-        let set_pos_status = self.display.set_position(data.col, data.row).await;
-        let write_str_status = self.display.write_str(&data.message).await;
+        let data = self.display.state.receive().await;
+        let set_pos_status = self.oled.set_position(data.col, data.row).await;
+        let write_str_status = self.oled.write_str(&data.message).await;
 
         if set_pos_status.is_err() || write_str_status.is_err() {
             log::info!("{:?}", set_pos_status);
             log::info!("{:?}", write_str_status);
             self.init().await;
+        }
+    }
+}
+
+struct Sensor<I2C> {
+    sensor: BME280<I2C>,
+    display: &'static DisplayMessage,
+    delay: embassy_time::Delay,
+}
+
+impl <I2C> Sensor <I2C>
+where
+    I2C: EmbeddedI2c + ErrorType, 
+{
+    fn new(sensor: BME280<I2C>, display: &'static DisplayMessage) -> Self {
+        Self {
+            sensor,
+            display,
+            delay: embassy_time::Delay,
+        }
+    }
+
+    async fn init(&mut self) {
+        loop {
+            match self.sensor.init(&mut self.delay) {
+                Ok(()) => {
+                    log::info!("BME280 initialized"); 
+                    break; 
+                },
+                Err(e) => {
+                    log::info!("{:?}", e);
+                }
+            }
+            Timer::after(Duration::from_millis(500)).await;
+        }
+    }
+
+    async fn write_to_display(&mut self, temp: f32, humidity: f32, pressure:f32) {
+        let mut temp_str = String::<32>::new();
+        let mut humidity_str = String::<32>::new();
+        let mut pressure_str = String::<32>::new();
+
+        write!(&mut temp_str,     "Temp:{:.2} C ", temp).unwrap();
+        write!(&mut humidity_str, "RH  :{:.2} % ", humidity).unwrap();
+        write!(&mut pressure_str, "P   :{:.3} atm ", (pressure*0.9869233)/100000.0).unwrap();
+
+        self.display.set_data(temp_str, 5, 0).await;
+        self.display.set_data(humidity_str, 6, 0).await;
+        self.display.set_data(pressure_str, 7, 0).await;
+    }
+
+    async fn measure(&mut self) {
+        match self.sensor.measure(&mut self.delay) {
+            Ok(data) => {
+                self.write_to_display(data.temperature, data.humidity, data.pressure).await;
+            },
+            Err(err) => {
+                log::info!("{:?}", err);
+                self.write_to_display(0.0, 0.0, 0.0).await;
+                self.init().await;
+            }
         }
     }
 }
@@ -177,81 +239,19 @@ async fn display_task(p: DisplayResources) {
 async fn bme_task(p: BmeResources) {
     let i2c = I2c::new_async(p.I2C_CH, p.SCL_PIN, p.SDA_PIN, Irqs, I2cConfig::default());
 
-    let mut delay = embassy_time::Delay;
-    let mut bme280 = BME280::new_primary(i2c);
-
-    loop {
-        match bme280.init(&mut delay) {
-            Ok(()) => {
-                log::info!("BME280 initialized"); 
-                break; 
-            },
-            Err(e) => {
-                log::info!("{:?}", e);
-            }
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-
+    let mut bme280 = Sensor::new(BME280::new_primary(i2c), &DISPLAY);
     let mut tick = Ticker::every(Duration::from_millis(500));
 
+    bme280.init().await;
+
     loop {
-        match bme280.measure(&mut delay) {
-            Ok(data) => {
-                let mut temp_str = String::<32>::new();
-                let mut humidity_str = String::<32>::new();
-                let mut pressure_str = String::<32>::new();
-
-                write!(&mut temp_str,     "Temp:{:.2} C", data.temperature).unwrap();
-                write!(&mut humidity_str, "RH  :{:.2} %", data.humidity).unwrap();
-                write!(&mut pressure_str, "P   :{:.3} atm", (data.pressure*0.9869233)/100000.0).unwrap();
-
-                DISPLAY.set_data(temp_str, 5, 0).await;
-                DISPLAY.set_data(humidity_str, 6, 0).await;
-                DISPLAY.set_data(pressure_str, 7, 0).await;
-            },
-            Err(_) => {
-                let mut temp_str = String::<32>::new();
-                let mut humidity_str = String::<32>::new();
-                let mut pressure_str = String::<32>::new();
-
-                write!(&mut temp_str,     "Temp: n/a C ").unwrap();
-                write!(&mut humidity_str, "RH  : n/a % ").unwrap();
-                write!(&mut pressure_str, "P   : n/a atm ").unwrap();
-
-                DISPLAY.set_data(temp_str, 5, 0).await;
-                DISPLAY.set_data(humidity_str, 6, 0).await;
-                DISPLAY.set_data(pressure_str, 7, 0).await;
-
-                loop {
-                    match bme280.init(&mut delay) {
-                        Ok(()) => {
-                            log::info!("BME280 initialized"); 
-                            break; 
-                        },
-                        Err(e) => {
-                            log::info!("{:?}", e);
-                        }
-                    }
-                    Timer::after(Duration::from_millis(500)).await;
-                }
-            }
-        }
-
+        bme280.measure().await;
         tick.next().await;
     }
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
-    let usb_driver = Driver::new(p.USB, Irqs);
-    spawner.must_spawn(usb_logger_task(usb_driver));
-
-    let ph = split_resources!(p);
-    spawner.must_spawn(display_task(ph.display_resources));
-    spawner.must_spawn(bme_task(ph.bme_resources));
-    
+#[embassy_executor::task]
+async fn pico_on_timer() {
     let mut tick = Ticker::every(Duration::from_secs(1));
     let uptime = Instant::now();
     
@@ -263,4 +263,16 @@ async fn main(spawner: Spawner) {
 
         tick.next().await;
     }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+    let ph = split_resources!(p);
+    let usb_driver = Driver::new(p.USB, Irqs);
+
+    spawner.must_spawn(usb_logger_task(usb_driver));
+    spawner.must_spawn(display_task(ph.display_resources));
+    spawner.must_spawn(pico_on_timer());
+    spawner.must_spawn(bme_task(ph.bme_resources));
 }

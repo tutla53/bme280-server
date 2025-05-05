@@ -56,6 +56,33 @@ use {
     {defmt_rtt as _, panic_probe as _},
 };
 
+macro_rules! safe_write {
+    ($target:expr, $($args:tt)*) => {
+        {
+            // Isolate the first mutable borrow
+            let target = $target;
+            match write!(target, $($args)*) {
+                Ok(_) => (),
+                Err(e) => {
+                    log::warn!("Write error: {:?}", e);
+                    
+                    // Isolate truncate operation
+                    {
+                        let t = target;
+                        t.truncate(t.capacity().saturating_sub(3));
+                    }
+                    
+                    // Isolate fallback write
+                    {
+                        let t = $target;
+                        let _ = write!(t, "...");
+                    }
+                }
+            }
+        }
+    };
+}
+
 static DISPLAY: DisplayMessage = DisplayMessage::new();
 static BME: BmeState = BmeState::new();
 static IP_ADDRESS: PicoAddress = PicoAddress::new();
@@ -222,7 +249,7 @@ where
             match self.oled.init().await{
                 Ok(()) => {
                     log::warn!("Display has been Initialized");
-                    self.oled.clear().await.unwrap();
+                    self.safe_clear().await;
                     self.set_title().await;
                     break;
                 }
@@ -234,6 +261,24 @@ where
         }   
     }
 
+    async fn safe_clear(&mut self) {
+        let mut retries = 0;
+        loop {
+            match self.oled.clear().await {
+                Ok(_) => break,
+                Err(e) if retries < 3 => {
+                    log::warn!("Clear failed (retry {}): {:?}", retries, e);
+                    Timer::after(Duration::from_millis(100 * retries)).await;
+                    retries += 1;
+                }
+                Err(e) => {
+                    log::error!("Permanent clear failure: {:?}", e);
+                    break;
+                }
+            }
+        }
+    }
+
     async fn set_title(&mut self) {
         let mut title = String::<32>::new();
         let mut second = String::<32>::new();
@@ -241,9 +286,9 @@ where
         
         let ip = self.ip_adress.get_ip().await;
         
-        write!(&mut title, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
-        write!(&mut second, "                   ").unwrap();
-        write!(&mut third,  "                   ").unwrap();
+        safe_write!(&mut title, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
+        safe_write!(&mut second, "                   ");
+        safe_write!(&mut third,  "                   ");
     
         self.display.set_data(title, 0, 0).await;
         self.display.set_data(second, 1, 0).await;
@@ -303,9 +348,9 @@ where
         let mut humidity_str = String::<32>::new();
         let mut pressure_str = String::<32>::new();
 
-        write!(&mut temp_str,     "Temp:{:.2} C ", temp).unwrap();
-        write!(&mut humidity_str, "RH  :{:.2} % ", humidity).unwrap();
-        write!(&mut pressure_str, "P   :{:.3} atm ", pressure).unwrap();
+        safe_write!(&mut temp_str,     "Temp:{:.2} C ", temp);
+        safe_write!(&mut humidity_str, "RH  :{:.2} % ", humidity);
+        safe_write!(&mut pressure_str, "P   :{:.3} atm ", pressure);
 
         self.display.set_data(temp_str, 5, 0).await;
         self.display.set_data(humidity_str, 6, 0).await;
@@ -370,7 +415,7 @@ async fn pico_on_timer() {
     loop {
         let uptime_format = TimeFormat::get_format(uptime.elapsed());
         let mut uptime_str = String::<32>::new();
-        write!(&mut uptime_str,   "{}d:{:02}h:{:02}m:{:02}s", uptime_format.days, uptime_format.hours, uptime_format.minutes, uptime_format.seconds).unwrap();
+        safe_write!(&mut uptime_str,   "{}d:{:02}h:{:02}m:{:02}s", uptime_format.days, uptime_format.hours, uptime_format.minutes, uptime_format.seconds);
         DISPLAY.set_data(uptime_str, 4, 0).await;
 
         tick.next().await;
@@ -389,9 +434,9 @@ fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> String<BUFF_SIZE>
             let after = &line[pos + ssi_tag.len()..];
             
             // Write the reconstructed line
-            write!(&mut processed_html, "{}{}{}\r\n", before, value, after).unwrap();
+            safe_write!(&mut processed_html, "{}{}{}\r\n", before, value, after);
         } else {
-            write!(&mut processed_html, "{}\r\n", line).unwrap();
+            safe_write!(&mut processed_html, "{}\r\n", line);
         }
     }
 
@@ -514,7 +559,7 @@ async fn main(spawner: Spawner) {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         let mut ip_str = String::<32>::new();
         let ip = IP_ADDRESS.get_ip().await;
-        write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
+        safe_write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
         DISPLAY.set_data(ip_str, 0, 0).await;
 
         log::info!("Listening on TCP: {} ...", TCP_PORT);
@@ -557,7 +602,7 @@ async fn main(spawner: Spawner) {
                             IP_ADDRESS.set_ip(Ipv4Address::new(0, 0, 0, 0)).await;
                             let mut ip_str = String::<32>::new();
                             let ip = Ipv4Address::new(0, 0, 0, 0);
-                            write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
+                            safe_write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
                             DISPLAY.set_data(ip_str, 0, 0).await;                    
                             break;
                         }
@@ -621,7 +666,7 @@ async fn main(spawner: Spawner) {
                 Ok(n) => {
                     let request = from_utf8(&buf[..n]).unwrap();
                     let mut processed_html = String::<BUFF_SIZE>::new();
-                    write!(&mut processed_html, "{}", html_str).unwrap();
+                    safe_write!(&mut processed_html, "{}", html_str);
 
                     // Handle button request
                     if request.starts_with("GET /led") {
@@ -634,9 +679,9 @@ async fn main(spawner: Spawner) {
                     let mut pressure_str = String::<32>::new();
                     
                     let data = BME.get_data().await;
-                    write!(&mut temp_str, "{:.2}", data.temperature).unwrap();
-                    write!(&mut humidity_str, "{:.2}", data.humidity).unwrap();
-                    write!(&mut pressure_str, "{:.3}", data.pressure).unwrap();
+                    safe_write!(&mut temp_str, "{:.2}", data.temperature);
+                    safe_write!(&mut humidity_str, "{:.2}", data.humidity);
+                    safe_write!(&mut pressure_str, "{:.3}", data.pressure);
                     
                     // Process SSI template
                     processed_html = process_ssi(processed_html.as_str(), SSI_TEMP_TAG, temp_str.as_str());
@@ -669,6 +714,5 @@ async fn main(spawner: Spawner) {
                 }
             };
         }
-    }
-    
+    }   
 }

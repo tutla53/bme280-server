@@ -10,7 +10,7 @@ use {
         DisplayResources,
         BmeResources,
     },
-    cyw43::JoinOptions,
+    cyw43::{JoinOptions, ScanOptions},
     cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER},
     embassy_executor::Spawner,
     embassy_time::{Duration, Timer, Instant, Ticker, with_timeout},
@@ -241,9 +241,9 @@ where
         
         let ip = self.ip_adress.get_ip().await;
         
-        write!(&mut title, "{}.{}.{}.{}      ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
-        write!(&mut second, "                ").unwrap();
-        write!(&mut third,  "                ").unwrap();
+        write!(&mut title, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
+        write!(&mut second, "                   ").unwrap();
+        write!(&mut third,  "                   ").unwrap();
     
         self.display.set_data(title, 0, 0).await;
         self.display.set_data(second, 1, 0).await;
@@ -510,13 +510,12 @@ async fn main(spawner: Spawner) {
     
     led_toggle_status = false;
 
-    let mut ip_str = String::<32>::new();
-    let ip = IP_ADDRESS.get_ip().await;
-    write!(&mut ip_str, "{}.{}.{}.{}      ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
-    DISPLAY.set_data(ip_str, 0, 0).await;
-
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        let mut ip_str = String::<32>::new();
+        let ip = IP_ADDRESS.get_ip().await;
+        write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
+        DISPLAY.set_data(ip_str, 0, 0).await;
 
         log::info!("Listening on TCP: {} ...", TCP_PORT);
         let socket_timeout = 10;
@@ -538,6 +537,73 @@ async fn main(spawner: Spawner) {
                 log::warn!("No Connection after {}s", socket_timeout);
                 control.gpio_set(0, led_toggle_status).await;
                 led_toggle_status  = !led_toggle_status;
+                let mut scan_result = control.scan(ScanOptions::default()).await;
+                let mut is_connected = false;
+
+                loop {
+                    match scan_result.next().await {
+                        Some(value) => {
+                            let arr = value.ssid;
+                            let end = value.ssid_len as usize;
+                            let ssid_char = core::str::from_utf8(&arr[..end]).expect("Valid UTF-8");
+                            if ssid_char == "hades" {
+                                log::info!("Found {}", ssid_char);
+                                is_connected = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            log::info!("Missing SSID");
+                            IP_ADDRESS.set_ip(Ipv4Address::new(0, 0, 0, 0)).await;
+                            let mut ip_str = String::<32>::new();
+                            let ip = Ipv4Address::new(0, 0, 0, 0);
+                            write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]).unwrap();
+                            DISPLAY.set_data(ip_str, 0, 0).await;                    
+                            break;
+                        }
+                    }
+                    Timer::after_millis(100).await;
+                }
+        
+                drop(scan_result);
+
+                if !is_connected {
+                    control.leave().await;
+                    loop {
+                        match control.join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
+                            Ok(_) => {
+                                Timer::after_millis(100).await;
+                                break
+                            },
+                            Err(err) => {
+                                if err.status<16 {
+                                    let error_code = err.status as usize;
+                                    control.gpio_set(0, led_toggle_status).await;
+                                    led_toggle_status = !led_toggle_status;
+                                    log::info!("Join failed with error = {}", CYW43_JOIN_ERROR[error_code]);
+                                }
+                            }
+                        }
+                    }
+
+                    // Wait for DHCP, not necessary when using static IP
+                    log::info!("Waiting for DHCP...");
+                    while !stack.is_config_up() {
+                        Timer::after_millis(100).await;
+                    }
+                    log::info!("DHCP is Now Up!");
+                    control.gpio_set(0, false).await;
+
+                    match stack.config_v4(){
+                        Some(value) => {
+                            log::info!("Server Address: {:?}", value.address.address());
+                            IP_ADDRESS.set_ip(value.address.address()).await;
+                            Timer::after_millis(100).await;
+                        },
+                        None => log::warn!("Unable to Get the Adrress")
+                    }
+
+                }
                 continue;
             }
         }

@@ -27,7 +27,7 @@ use {
         StackResources,
         Ipv4Address,
     },
-    embassy_futures::select::select4,
+    embassy_futures::select::{select, Either},
     embassy_rp::{
         watchdog::Watchdog,
         clocks::RoscRng,
@@ -89,10 +89,10 @@ macro_rules! safe_write {
 static DISPLAY: DisplayMessage = DisplayMessage::new();
 static BME: BmeState = BmeState::new();
 static IP_ADDRESS: PicoAddress = PicoAddress::new();
-static BME_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
-static DISPLAY_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
-static TIMER_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
-static WIFI_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
+static BME_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 50> = Channel::new();
+static DISPLAY_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 50> = Channel::new();
+static TIMER_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 50> = Channel::new();
+static WIFI_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 50> = Channel::new();
 
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
@@ -407,16 +407,57 @@ async fn usb_logger_task(driver: Driver<'static, USB>) {
 #[embassy_executor::task]
 async fn watchdog_task(p: WatchdogResources) {
     let mut watchdog = Watchdog::new(p.WATCHDOG);
-    watchdog.start(Duration::from_secs(5));
+    watchdog.start(Duration::from_secs(8));
     
     loop {
-        let _ = select4(
+        // Fast Task
+        let bme_alive = match select(
             BME_WATCHDOG.receive(),
+            Timer::after(Duration::from_secs(5)),
+        ).await {
+            Either::First(_) => {
+                watchdog.feed();
+                true
+            },
+            Either::Second(_) => false,
+        };
+
+        let timer_alive = match select(
             TIMER_WATCHDOG.receive(),
+            Timer::after(Duration::from_secs(5)),
+        ).await {
+            Either::First(_) => {
+                watchdog.feed();
+                true
+            },
+            Either::Second(_) => false,
+        };
+
+        let display_alive = match select(
             DISPLAY_WATCHDOG.receive(),
+            Timer::after(Duration::from_secs(5)),
+        ).await {
+            Either::First(_) => {
+                watchdog.feed();
+                true
+            },
+            Either::Second(_) => false,
+        };
+
+        let wifi_alive = match select(
             WIFI_WATCHDOG.receive(),
-        ).await;
-        watchdog.feed();
+            Timer::after(Duration::from_secs(5)),
+        ).await {
+            Either::First(_) => {
+                watchdog.feed();
+                true
+            },
+            Either::Second(_) => false,
+        };
+
+        if !(bme_alive && timer_alive && display_alive && wifi_alive) {
+            break;
+        }
     }
 }
 
@@ -564,11 +605,11 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(net_task(runner));
 
     // Connecting to the Network
+    let mut retry_delay = Duration::from_secs(1);
     loop {
         let _ = WIFI_WATCHDOG.try_send(true);
         match control.join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
             Ok(_) => {
-                Timer::after_millis(100).await;
                 break
             },
             Err(err) => {
@@ -577,6 +618,7 @@ async fn main(spawner: Spawner) {
                     control.gpio_set(0, led_toggle_status).await;
                     led_toggle_status = !led_toggle_status;
                     log::info!("Join failed with error = {}", CYW43_JOIN_ERROR[error_code]);
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
                 }
             }
         }
@@ -723,7 +765,24 @@ async fn main(spawner: Spawner) {
                     break;
                 }
                 Ok(n) => {
-                    let request = from_utf8(&buf[..n]).unwrap();
+                    let mut total_read = n;    
+                    while !buf[..total_read].ends_with(b"\r\n\r\n") {
+                        if total_read >= BUFF_SIZE {
+                            log::warn!("Request too large!");
+                            break;
+                        }
+                            
+                        // Read more data
+                        match socket.read(&mut buf[total_read..]).await {
+                            Ok(bytes_read) => total_read += bytes_read,
+                            Err(e) => {
+                                log::warn!("Read error during accumulation: {:?}", e);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    let request = from_utf8(&buf[..total_read]).unwrap();
                     let mut processed_html = String::<BUFF_SIZE>::new();
                     safe_write!(&mut processed_html, "{}", html_str);
 

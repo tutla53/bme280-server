@@ -100,6 +100,7 @@ const CLIENT_NAME: &str = "Pico-W";
 const TCP_PORT: u16 = 80;
 const BUFF_SIZE: usize = 8192;
 const HTML_BYTES: &[u8] = include_bytes!("html/index.html");
+const ERROR_BYTES: &[u8] = include_bytes!("html/error_page.html");
 const SSI_TEMP_TAG: &str = "<!--#TEMP-->";
 const SSI_HUMID_TAG: &str = "<!--#HUMID-->";
 const SSI_PRESSURE_TAG: &str = "<!--#PRESSURE-->";
@@ -466,7 +467,7 @@ async fn pico_on_timer() {
     }
 }
 
-fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> String<BUFF_SIZE> {
+fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> Result<String<BUFF_SIZE>, ()> {
     let mut processed_html = String::<BUFF_SIZE>::new();
     
     for line in html_file.lines() {
@@ -484,7 +485,11 @@ fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> String<BUFF_SIZE>
         }
     }
 
-    return processed_html;
+    if processed_html.len() >= BUFF_SIZE - 100 {
+        return Err(());
+    }
+
+    return Ok(processed_html);
 }
 
 #[embassy_executor::task]
@@ -598,6 +603,7 @@ async fn main(spawner: Spawner) {
     let mut tx_buffer = [0; BUFF_SIZE];
     let mut buf = [0; BUFF_SIZE];
     let html_str = core::str::from_utf8(HTML_BYTES).unwrap_or("[INVALID UTF-8]");
+    let error_str = core::str::from_utf8(ERROR_BYTES).unwrap_or("[INVALID UTF-8]");
     
     led_toggle_status = false;
 
@@ -737,9 +743,40 @@ async fn main(spawner: Spawner) {
                     safe_write!(&mut pressure_str, "{:.3}", data.pressure);
                     
                     // Process SSI template
-                    processed_html = process_ssi(processed_html.as_str(), SSI_TEMP_TAG, temp_str.as_str());
-                    processed_html = process_ssi(processed_html.as_str(), SSI_HUMID_TAG, humidity_str.as_str());
-                    processed_html = process_ssi(processed_html.as_str(), SSI_PRESSURE_TAG, pressure_str.as_str());
+                    processed_html = match process_ssi(processed_html.as_str(), SSI_TEMP_TAG, temp_str.as_str()) {
+                        Ok(result) => { 
+                            result
+                        },
+                        Err(_) => {
+                            log::info!("HTML near capacity!");
+                            String::new()
+                        }
+                    };
+
+                    processed_html = match process_ssi(processed_html.as_str(), SSI_HUMID_TAG, humidity_str.as_str()) {
+                        Ok(result) => { 
+                            result
+                        },
+                        Err(_) => {
+                            log::info!("HTML near capacity!");
+                            String::new()
+                        }
+                    };
+
+                    processed_html = match process_ssi(processed_html.as_str(), SSI_PRESSURE_TAG, pressure_str.as_str()) {
+                        Ok(result) => { 
+                            result
+                        },
+                        Err(_) => {
+                            log::info!("HTML near capacity!");
+                            String::new()
+                        }
+                    };
+                    
+                    if processed_html.is_empty() {
+                        safe_write!(&mut processed_html, "{}", error_str);
+                        log::info!("HTML generation failed");
+                    }
 
                     // Build HTTP response
                     let mut response = String::<BUFF_SIZE>::new();

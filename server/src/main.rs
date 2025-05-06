@@ -27,7 +27,7 @@ use {
         StackResources,
         Ipv4Address,
     },
-    embassy_futures::select::{select, Either},
+    embassy_futures::select::{select4, select, Either4, Either},
     embassy_rp::{
         watchdog::Watchdog,
         clocks::RoscRng,
@@ -410,54 +410,54 @@ async fn watchdog_task(p: WatchdogResources) {
     watchdog.start(Duration::from_secs(8));
     
     loop {
-        // Fast Task
-        let bme_alive = match select(
-            BME_WATCHDOG.receive(),
-            Timer::after(Duration::from_secs(5)),
-        ).await {
-            Either::First(_) => {
-                watchdog.feed();
-                true
-            },
-            Either::Second(_) => false,
-        };
+        // Create futures for each watchdog channel
+        let bme_fut = BME_WATCHDOG.receive();
+        let timer_fut = TIMER_WATCHDOG.receive();
+        let display_fut = DISPLAY_WATCHDOG.receive();
+        let wifi_fut = WIFI_WATCHDOG.receive();
 
-        let timer_alive = match select(
-            TIMER_WATCHDOG.receive(),
-            Timer::after(Duration::from_secs(5)),
+        // Wait for all signals with timeout
+        match select4(
+            select(bme_fut, Timer::after(Duration::from_secs(5))),
+            select(timer_fut, Timer::after(Duration::from_secs(5))),
+            select(display_fut, Timer::after(Duration::from_secs(5))),
+            select(wifi_fut, Timer::after(Duration::from_secs(5))),
         ).await {
-            Either::First(_) => {
-                watchdog.feed();
-                true
+            Either4::First(value) => {
+                match value {
+                    Either::First(_) => {},
+                    Either::Second(_) => {
+                        break;
+                    }
+                }
             },
-            Either::Second(_) => false,
-        };
-
-        let display_alive = match select(
-            DISPLAY_WATCHDOG.receive(),
-            Timer::after(Duration::from_secs(5)),
-        ).await {
-            Either::First(_) => {
-                watchdog.feed();
-                true
+            Either4::Second(value) => {
+                match value {
+                    Either::First(_) => {},
+                    Either::Second(_) => {
+                        break;
+                    }
+                }
             },
-            Either::Second(_) => false,
-        };
-
-        let wifi_alive = match select(
-            WIFI_WATCHDOG.receive(),
-            Timer::after(Duration::from_secs(5)),
-        ).await {
-            Either::First(_) => {
-                watchdog.feed();
-                true
+            Either4::Third(value) => {
+                match value {
+                    Either::First(_) => {},
+                    Either::Second(_) => {
+                        break;
+                    }
+                }
             },
-            Either::Second(_) => false,
-        };
-
-        if !(bme_alive && timer_alive && display_alive && wifi_alive) {
-            break;
+            Either4::Fourth(value) => {
+                match value {
+                    Either::First(_) => {},
+                    Either::Second(_) => {
+                        break;
+                    }
+                }
+            },
         }
+
+        watchdog.feed();
     }
 }
 

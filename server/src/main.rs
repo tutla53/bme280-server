@@ -9,6 +9,7 @@ use {
         AssignedResources,
         DisplayResources,
         BmeResources,
+        WatchdogResources,
     },
     cyw43::{JoinOptions, ScanOptions},
     cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER},
@@ -26,7 +27,9 @@ use {
         StackResources,
         Ipv4Address,
     },
+    embassy_futures::select::select4,
     embassy_rp::{
+        watchdog::Watchdog,
         clocks::RoscRng,
         gpio::{Level, Output},
         peripherals::{DMA_CH0, PIO0, USB},
@@ -86,6 +89,10 @@ macro_rules! safe_write {
 static DISPLAY: DisplayMessage = DisplayMessage::new();
 static BME: BmeState = BmeState::new();
 static IP_ADDRESS: PicoAddress = PicoAddress::new();
+static BME_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
+static DISPLAY_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
+static TIMER_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
+static WIFI_WATCHDOG: Channel<CriticalSectionRawMutex, bool, 10> = Channel::new();
 
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
@@ -96,7 +103,7 @@ const HTML_BYTES: &[u8] = include_bytes!("html/index.html");
 const SSI_TEMP_TAG: &str = "<!--#TEMP-->";
 const SSI_HUMID_TAG: &str = "<!--#HUMID-->";
 const SSI_PRESSURE_TAG: &str = "<!--#PRESSURE-->";
-
+const MAX_OLED_CHAR: usize = 16;
 const CYW43_JOIN_ERROR: [&str; 16] = [
     "Success", 
     "Operation failed", 
@@ -138,7 +145,7 @@ impl BmeState {
         return *self.state.lock().await;
     }
 
-    async fn set_data(&self, temperature:f32, humidity:f32, pressure:f32) {
+    async fn set_sensor_data(&self, temperature:f32, humidity:f32, pressure:f32) {
         let new_state = BmeData {
             temperature: temperature, 
             humidity:humidity, 
@@ -197,13 +204,13 @@ impl TimeFormat {
 }
 
 struct MessageFormat {
-    message: String<32>,
+    message: String<MAX_OLED_CHAR>,
     row: u8,
     col: u8,
 }
 
 struct DisplayMessage {
-    state : Channel<CriticalSectionRawMutex, MessageFormat, 1024>,
+    state : Channel<CriticalSectionRawMutex, MessageFormat, 32>,
 }
 
 impl DisplayMessage {
@@ -213,7 +220,7 @@ impl DisplayMessage {
         }
     }
 
-    async fn set_data(&self, message: String<32>, row: u8, col:u8) {
+    fn set_data(&self, message: String<MAX_OLED_CHAR>, row: u8, col:u8) {
         
         let new_state = MessageFormat {
             message: message,
@@ -221,7 +228,12 @@ impl DisplayMessage {
             col: col,
         };
 
-        self.state.send(new_state).await;
+        match self.state.try_send(new_state) {
+            Ok(()) => {},
+            Err(_) => {
+                log::warn!("Display channel full!");
+            },
+        };
     }
 }
 
@@ -280,23 +292,25 @@ where
     }
 
     async fn set_title(&mut self) {
-        let mut title = String::<32>::new();
-        let mut second = String::<32>::new();
-        let mut third = String::<32>::new();
+        let mut title = String::<MAX_OLED_CHAR>::new();
+        let mut blank = String::<MAX_OLED_CHAR>::new();
         
         let ip = self.ip_adress.get_ip().await;
         
-        safe_write!(&mut title, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
-        safe_write!(&mut second, "                   ");
-        safe_write!(&mut third,  "                   ");
+        safe_write!(&mut title, "{}.{}.{}.{}", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
+        safe_write!(&mut blank, "");
     
-        self.display.set_data(title, 0, 0).await;
-        self.display.set_data(second, 1, 0).await;
-        self.display.set_data(third, 2, 0).await;
+        self.display.set_data(title, 0, 0);
+        self.display.set_data(blank.clone(), 1, 0);
+        self.display.set_data(blank.clone(), 2, 0);
     }
 
     async fn write_available_message(&mut self) {
-        let data = self.display.state.receive().await;
+        let mut data = self.display.state.receive().await;
+
+        // Add Space to Clear Uwanted Character on OLED
+        let _ = write!(data.message, "{: <1$}", "", MAX_OLED_CHAR - data.message.len());
+        
         let set_pos_status = self.oled.set_position(data.col, data.row).await;
         let write_str_status = self.oled.write_str(&data.message).await;
 
@@ -344,28 +358,40 @@ where
     }
 
     async fn write_to_display(&mut self, temp: f32, humidity: f32, pressure:f32) {
-        let mut temp_str = String::<32>::new();
-        let mut humidity_str = String::<32>::new();
-        let mut pressure_str = String::<32>::new();
+        let mut temp_str = String::<MAX_OLED_CHAR>::new();
+        let mut humidity_str = String::<MAX_OLED_CHAR>::new();
+        let mut pressure_str = String::<MAX_OLED_CHAR>::new();
+        
+        safe_write!(&mut temp_str,     "Temp:{:.2} C", temp);
+        safe_write!(&mut humidity_str, "RH  :{:.2} %", humidity);
+        safe_write!(&mut pressure_str, "P   :{:.3} atm", pressure);
 
-        safe_write!(&mut temp_str,     "Temp:{:.2} C ", temp);
-        safe_write!(&mut humidity_str, "RH  :{:.2} % ", humidity);
-        safe_write!(&mut pressure_str, "P   :{:.3} atm ", pressure);
-
-        self.display.set_data(temp_str, 5, 0).await;
-        self.display.set_data(humidity_str, 6, 0).await;
-        self.display.set_data(pressure_str, 7, 0).await;
+        self.display.set_data(temp_str, 5, 0);
+        self.display.set_data(humidity_str, 6, 0);
+        self.display.set_data(pressure_str, 7, 0);
     }
 
     async fn measure(&mut self) {
         match self.sensor.measure(&mut self.delay) {
             Ok(data) => {
+                self.state.set_sensor_data(data.temperature, data.humidity, (data.pressure*0.9869233)/100000.0).await;
                 self.write_to_display(data.temperature, data.humidity, (data.pressure*0.9869233)/100000.0).await;
-                self.state.set_data(data.temperature, data.humidity, (data.pressure*0.9869233)/100000.0).await;
             },
             Err(err) => {
                 log::info!("{:?}", err);
-                self.write_to_display(0.0, 0.0, 0.0).await;
+                self.state.set_sensor_data(0.0, 0.0, 0.0).await;
+
+                let mut temp_str = String::<MAX_OLED_CHAR>::new();
+                let mut humidity_str = String::<MAX_OLED_CHAR>::new();
+                let mut pressure_str = String::<MAX_OLED_CHAR>::new();
+                
+                safe_write!(&mut temp_str,     "Temp: Error");
+                safe_write!(&mut humidity_str, "RH  : Error");
+                safe_write!(&mut pressure_str, "P   : Error");
+
+                self.display.set_data(temp_str, 5, 0);
+                self.display.set_data(humidity_str, 6, 0);
+                self.display.set_data(pressure_str, 7, 0);
                 self.init().await;
             }
         }
@@ -375,6 +401,22 @@ where
 #[embassy_executor::task]
 async fn usb_logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+}
+
+#[embassy_executor::task]
+async fn watchdog_task(p: WatchdogResources) {
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    watchdog.start(Duration::from_secs(5));
+    
+    loop {
+        let _ = select4(
+            BME_WATCHDOG.receive(),
+            TIMER_WATCHDOG.receive(),
+            DISPLAY_WATCHDOG.receive(),
+            WIFI_WATCHDOG.receive(),
+        ).await;
+        watchdog.feed();
+    }
 }
 
 #[embassy_executor::task]
@@ -389,6 +431,7 @@ async fn display_task(p: DisplayResources) {
 
     loop {
         oled.write_available_message().await;
+        let _ = DISPLAY_WATCHDOG.try_send(true);
     }
 }
 
@@ -403,6 +446,7 @@ async fn bme_task(p: BmeResources) {
 
     loop {
         bme280.measure().await;
+        let _ = BME_WATCHDOG.try_send(true);
         tick.next().await;
     }
 }
@@ -414,15 +458,15 @@ async fn pico_on_timer() {
     
     loop {
         let uptime_format = TimeFormat::get_format(uptime.elapsed());
-        let mut uptime_str = String::<32>::new();
+        let mut uptime_str = String::<MAX_OLED_CHAR>::new();
         safe_write!(&mut uptime_str,   "{}d:{:02}h:{:02}m:{:02}s", uptime_format.days, uptime_format.hours, uptime_format.minutes, uptime_format.seconds);
-        DISPLAY.set_data(uptime_str, 4, 0).await;
-
+        DISPLAY.set_data(uptime_str, 4, 0);
+        let _ = TIMER_WATCHDOG.try_send(true);
         tick.next().await;
     }
 }
 
-fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> String<BUFF_SIZE>{
+fn process_ssi(html_file: &str, ssi_tag: &str, value: &str) -> String<BUFF_SIZE> {
     let mut processed_html = String::<BUFF_SIZE>::new();
     
     for line in html_file.lines() {
@@ -463,6 +507,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(display_task(ph.display_resources));
     spawner.must_spawn(pico_on_timer());
     spawner.must_spawn(bme_task(ph.bme_resources));
+    spawner.must_spawn(watchdog_task(ph.watchdog_resources));
     
     // WIFI Task
     let mut led_toggle_status = true;
@@ -515,6 +560,7 @@ async fn main(spawner: Spawner) {
 
     // Connecting to the Network
     loop {
+        let _ = WIFI_WATCHDOG.try_send(true);
         match control.join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
             Ok(_) => {
                 Timer::after_millis(100).await;
@@ -551,19 +597,22 @@ async fn main(spawner: Spawner) {
     let mut rx_buffer = [0; BUFF_SIZE];
     let mut tx_buffer = [0; BUFF_SIZE];
     let mut buf = [0; BUFF_SIZE];
-    let html_str = from_utf8(HTML_BYTES).unwrap();
+    let html_str = core::str::from_utf8(HTML_BYTES).unwrap_or("[INVALID UTF-8]");
     
     led_toggle_status = false;
 
     loop {
+        let _ = WIFI_WATCHDOG.try_send(true);
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        let mut ip_str = String::<32>::new();
+        let mut ip_str = String::<MAX_OLED_CHAR>::new();
         let ip = IP_ADDRESS.get_ip().await;
-        safe_write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
-        DISPLAY.set_data(ip_str, 0, 0).await;
+        safe_write!(&mut ip_str, "{}.{}.{}.{}", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
+        DISPLAY.set_data(ip_str, 0, 0);
 
         log::info!("Listening on TCP: {} ...", TCP_PORT);
-        let socket_timeout = 10;
+        let socket_timeout = 2;
+
+        let _ = WIFI_WATCHDOG.try_send(true);
         match with_timeout(Duration::from_secs(socket_timeout), socket.accept(TCP_PORT)).await {
             Ok(value) => {
                 match value {
@@ -586,12 +635,13 @@ async fn main(spawner: Spawner) {
                 let mut is_connected = false;
 
                 loop {
+                    let _ = WIFI_WATCHDOG.try_send(true);
                     match scan_result.next().await {
                         Some(value) => {
                             let arr = value.ssid;
                             let end = value.ssid_len as usize;
-                            let ssid_char = core::str::from_utf8(&arr[..end]).expect("Valid UTF-8");
-                            if ssid_char == "hades" {
+                            let ssid_char = core::str::from_utf8(&arr[..end]).unwrap_or_default();
+                            if ssid_char == WIFI_NETWORK {
                                 log::info!("Found {}", ssid_char);
                                 is_connected = true;
                                 break;
@@ -600,10 +650,10 @@ async fn main(spawner: Spawner) {
                         None => {
                             log::info!("Missing SSID");
                             IP_ADDRESS.set_ip(Ipv4Address::new(0, 0, 0, 0)).await;
-                            let mut ip_str = String::<32>::new();
+                            let mut ip_str = String::<MAX_OLED_CHAR>::new();
                             let ip = Ipv4Address::new(0, 0, 0, 0);
-                            safe_write!(&mut ip_str, "{}.{}.{}.{}         ", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
-                            DISPLAY.set_data(ip_str, 0, 0).await;                    
+                            safe_write!(&mut ip_str, "{}.{}.{}.{}", ip.octets()[0], ip.octets()[1], ip.octets()[2], ip.octets()[3]);
+                            DISPLAY.set_data(ip_str, 0, 0);                    
                             break;
                         }
                     }
@@ -615,6 +665,7 @@ async fn main(spawner: Spawner) {
                 if !is_connected {
                     control.leave().await;
                     loop {
+                        let _ = WIFI_WATCHDOG.try_send(true);
                         match control.join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
                             Ok(_) => {
                                 Timer::after_millis(100).await;
@@ -634,6 +685,7 @@ async fn main(spawner: Spawner) {
                     // Wait for DHCP, not necessary when using static IP
                     log::info!("Waiting for DHCP...");
                     while !stack.is_config_up() {
+                        let _ = WIFI_WATCHDOG.try_send(true);
                         Timer::after_millis(100).await;
                     }
                     log::info!("DHCP is Now Up!");
@@ -658,6 +710,7 @@ async fn main(spawner: Spawner) {
 
         // Currently only accept 1 connection at a time
         loop {
+            let _ = WIFI_WATCHDOG.try_send(true);
             match socket.read(&mut buf).await {
                 Ok(0) => {
                     log::info!("Connection closed by client");
@@ -674,9 +727,9 @@ async fn main(spawner: Spawner) {
                         control.gpio_set(0, led_toggle_status).await;
                     } 
 
-                    let mut temp_str = String::<32>::new();
-                    let mut humidity_str = String::<32>::new();
-                    let mut pressure_str = String::<32>::new();
+                    let mut temp_str = String::<MAX_OLED_CHAR>::new();
+                    let mut humidity_str = String::<MAX_OLED_CHAR>::new();
+                    let mut pressure_str = String::<MAX_OLED_CHAR>::new();
                     
                     let data = BME.get_data().await;
                     safe_write!(&mut temp_str, "{:.2}", data.temperature);
@@ -690,24 +743,18 @@ async fn main(spawner: Spawner) {
 
                     // Build HTTP response
                     let mut response = String::<BUFF_SIZE>::new();
+
+                    safe_write!(&mut response,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                        processed_html.len(),
+                        processed_html);
                     
-                    match write!(&mut response,
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
-                                processed_html.len(),
-                                processed_html) 
-                    {
-                        Ok(_) => {
-                            if let Err(e) = socket.write_all(response.as_bytes()).await {
-                                log::warn!("Write Error: {:?}", e);
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            log::error!("Response buffer overflow: Buffer is too small");
-                            break;
-                        }
-                    }
-                }
+                    if let Err(e) = socket.write_all(response.as_bytes()).await {
+                        log::warn!("Write Error: {:?}", e);
+                        break;
+                    };
+                },
+                
                 Err(e) => {
                     log::warn!("Read Error: {:?}", e);
                     break;

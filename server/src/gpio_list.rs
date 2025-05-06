@@ -26,6 +26,9 @@ assign_resources! {
         SCL_PIN: PIN_13,
         SDA_PIN: PIN_12,
     }
+    watchdog_resources: WatchdogResources{
+        WATCHDOG: WATCHDOG,
+    }
 }
 
 bind_interrupts!(pub struct Irqs {

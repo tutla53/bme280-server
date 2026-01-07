@@ -3,52 +3,61 @@
 
 mod gpio_list;
 
-use {
-    crate::gpio_list::{
-        Irqs,
-        AssignedResources,
-        DisplayResources,
-        BmeResources,
-        WatchdogResources,
-    },
-    cyw43::{JoinOptions, ScanOptions},
-    cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER},
-    embassy_executor::Spawner,
-    embassy_time::{Duration, Timer, Ticker, with_timeout},
-    embassy_sync::{
-        mutex::Mutex,
-        channel::Channel,
-        blocking_mutex::raw::CriticalSectionRawMutex,
-    },
-    embassy_net::{
-        tcp::TcpSocket,
-        Config,
-        DhcpConfig, 
-        StackResources,
-        Ipv4Address,
-    },
-    embassy_rp::{
-        watchdog::Watchdog,
-        clocks::RoscRng,
-        gpio::{Level, Output},
-        peripherals::{DMA_CH0, PIO0, USB},
-        usb::Driver,
-        pio::Pio,
-        i2c::{I2c, Config as I2cConfig},
-    },
-    embedded_hal::i2c::{I2c as EmbeddedI2c, ErrorType},
-    heapless::String,
-    core::{
-        fmt::Write,
-        str::from_utf8,
-        str::FromStr,
-    },
-    rand_core::RngCore,
-    bme280::i2c::BME280,
-    embedded_io_async::Write as EmbeddedWriter,
-    static_cell::StaticCell,
-    {defmt_rtt as _, panic_probe as _},
-};
+use crate::gpio_list::Irqs;
+use crate::gpio_list::AssignedResources;
+use crate::gpio_list::DisplayResources;
+use crate::gpio_list::BmeResources;
+use crate::gpio_list::WatchdogResources;
+
+use cyw43::JoinOptions;
+use cyw43::ScanOptions;
+use cyw43_pio::PioSpi;
+use cyw43_pio::DEFAULT_CLOCK_DIVIDER;
+
+use embassy_executor::Spawner;
+
+use embassy_time::Duration;
+use embassy_time::Timer;
+use embassy_time::Ticker; 
+use embassy_time::with_timeout;
+
+use embassy_sync::mutex::Mutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+use embassy_net::tcp::TcpSocket;
+use embassy_net::Config;
+use embassy_net::DhcpConfig;
+use embassy_net::StackResources;
+use embassy_net::Ipv4Address;
+
+use embassy_rp::watchdog::Watchdog;
+use embassy_rp::clocks::RoscRng;
+use embassy_rp::gpio::Level;
+use embassy_rp::gpio::Output;
+use embassy_rp::peripherals::DMA_CH0;
+use embassy_rp::peripherals:: PIO0;
+use embassy_rp::peripherals:: USB;
+use embassy_rp::usb::Driver;
+use embassy_rp::pio::Pio;
+use embassy_rp::i2c::I2c;
+use embassy_rp::i2c:: Config as I2cConfig;
+
+use embedded_hal::i2c::I2c as EmbeddedI2c;
+use embedded_hal::i2c::ErrorType;
+
+use heapless::String;
+use core::fmt::Write;
+use core::str::from_utf8;
+use core::str::FromStr;
+
+use rand_core::RngCore;
+use bme280::i2c::BME280;
+use embedded_io_async::Write as EmbeddedWriter;
+use static_cell::StaticCell;
+
+use defmt_rtt as _;
+use panic_probe as _;
 
 macro_rules! safe_write {
     ($target:expr, $($args:tt)*) => {
@@ -201,7 +210,12 @@ where
     async fn measure(&mut self) {
         match self.sensor.measure(&mut self.delay) {
             Ok(data) => {
-                self.state.set_sensor_data(data.temperature, data.humidity, (data.pressure*0.9869233)/100000.0).await;
+                let temp = data.temperature;
+                let humid = data.humidity * 0.1818+44.81818;
+                let pressure = (data.pressure*0.9869233)/100000.0;
+
+                self.state.set_sensor_data(temp, humid, pressure).await;
+                log::info!("Temp: {} C, RH: {} %, pressure: {} atm", temp, humid, pressure);
             },
             Err(err) => {
                 log::info!("{:?}", err);

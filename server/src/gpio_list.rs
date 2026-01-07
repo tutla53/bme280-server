@@ -3,17 +3,13 @@
 //! This module defines the hardware resources used by various components of the robot.
 //! It uses the `assign_resources` macro to allocate specific pins and peripherals to each component.
 
-use {
-    assign_resources::assign_resources,
-    embassy_rp::{
-        bind_interrupts,
-        peripherals,
-        peripherals::{PIO0, USB, I2C0, I2C1},
-        pio::InterruptHandler as PioInterruptHandler,
-        usb::InterruptHandler as UsbInterruptHandler,
-        i2c::InterruptHandler as I2cInterruptHandler,
-    },
-};
+use assign_resources::assign_resources;
+use embassy_rp::bind_interrupts;
+use embassy_rp::peripherals;
+use embassy_rp::peripherals::{PIO0, USB, I2C0, I2C1};
+use embassy_rp::pio::InterruptHandler as PioInterruptHandler;
+use embassy_rp::usb::InterruptHandler as UsbInterruptHandler;
+use embassy_rp::i2c::InterruptHandler as I2cInterruptHandler;
 
 assign_resources! {
     display_resources: DisplayResources {
